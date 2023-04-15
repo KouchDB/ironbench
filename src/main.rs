@@ -1,5 +1,7 @@
-use hyper::body::{to_bytes};
+use hyper::body::to_bytes;
+use hyper::service::{make_service_fn, service_fn};
 use hyper::{ Body, Method, Request, Response, StatusCode };
+use hyper::server::{Server, conn::AddrStream};
 use rusqlite::{params, Connection, Error };
 use serde::{ Deserialize, Serialize };
 use std::collections::HashMap;
@@ -26,13 +28,10 @@ impl Database {
     fn new(data_dir: PathBuf) -> io::Result<Self> {
         let data_file_path = data_dir.join("data.txt");
         let index_file_path = data_dir.join("index.db");
-        let file = OpenOptions::new().create(true).append(true).open(&data_file_path)?;
+        let file = OpenOptions::new().create(true).read(true).append(true).open(&data_file_path)?;
         let index_conn = Connection::open(&index_file_path).unwrap();
         index_conn.execute(
-            "CREATE TABLE IF NOT EXISTS index (
-                id TEXT PRIMARY KEY,
-                offset INTEGER
-            )",
+            "CREATE TABLE IF NOT EXISTS 'index' (id TEXT PRIMARY KEY, offset INTEGER)",
             []
         ).unwrap();
         Ok(Database { file, index_conn })
@@ -40,13 +39,13 @@ impl Database {
 
     fn get_document(&self, id: &str) -> io::Result<Option<Document>> {
         let offset = match self.index_conn.query_row(
-            "SELECT offset FROM index WHERE id = ?1",
+            "SELECT offset FROM 'index' WHERE id = ?1",
             params![id],
             |row| Ok(row.get::<usize, i64>(0)? as u64),
         ) {
             Ok(offset) => offset,
             Err(Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
+            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e))
         };
         let mut reader = io::BufReader::new(&self.file);
         reader.seek(SeekFrom::Start(offset))?;
@@ -56,14 +55,14 @@ impl Database {
         Ok(Some(document))
     }
 
-    fn put_document(&self, document: &Document) -> io::Result<()> {
+    fn put_document(&mut self, document: &Document) -> io::Result<()> {
         let offset = self.file.seek(SeekFrom::End(0))?;
         let line = serde_json::to_string(&document)?;
         let mut buf = line.into_bytes();
         buf.push(b'\n');
         self.file.write_all(&buf)?;
         self.index_conn.execute(
-            "INSERT OR REPLACE INTO index (id, offset) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO 'index' (id, offset) VALUES (?1, ?2)",
             params![document.id, offset as i64],
         ).unwrap();
         Ok(())
@@ -71,10 +70,9 @@ impl Database {
 }
 
 async fn handle_request(
-    req: &mut Request<Body>
+    mut req: Request<Body>
 ) -> Result<Response<Body>, hyper::http::Error> {
-    let database = &Database::new(PathBuf::from(".")).unwrap();
-
+    let database = &mut Database::new(PathBuf::from(".")).unwrap();
     let path = req.uri().path().to_owned();
     let method = &req.method().clone();
     match (method, path) {
@@ -91,16 +89,15 @@ async fn handle_request(
                 Ok(None) => Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()),
                 Err(e) => {
                     eprintln!("database error: {}", e);
-                    Response::builder()
-
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
+                    Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR)
+                                       .body(Body::empty())
                 }
             }
         }
         (&Method::PUT, path) if path.starts_with("/db/") => {
             let id = &path[4..];
-            let body = to_bytes(req.body_mut()).await.unwrap();
+            let body = to_bytes(&mut req.body_mut()).await.unwrap();
+            eprintln!("body = {:?}", body);
             let document: Document = serde_json::from_slice(&body).unwrap();
             assert_eq!(document.id, id);
             database.put_document(&document).unwrap();
@@ -115,23 +112,20 @@ async fn handle_request(
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
-
-    let make_svc = hyper::service::make_service_fn(|_addr_stream| {
-        async {
-            Ok::<_, hyper::Error>(hyper::service::service_fn(|req|handle_request(&mut req)))
+    let make_svc = make_service_fn(|socket: &AddrStream | {
+        println!("Connected with {:?}", socket.remote_addr());
+        async move {
+            Ok::<_, hyper::Error>(service_fn(|req| handle_request(req)))
         }
     });
 
-    let server = hyper::server::Server::bind(&addr).serve(make_svc);
-
     println!("Listening on http://{}", addr);
 
-    // handle the hyper::Error by converting it to a std::io::Error
-    if let Err(e) = server.await.map_err(|e| io::Error::new(io::ErrorKind::Other, e)) {
-        eprintln!("server error: {}", e);
+    if let Err(e) = Server::bind(&addr).serve(make_svc).await {
+        eprintln!("server error: {}", e)
     }
 
     Ok(())
